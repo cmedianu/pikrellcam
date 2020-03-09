@@ -1,6 +1,6 @@
 /* PiKrellCam
 |
-|  Copyright (C) 2015-2017 Bill Wilson    billw@gkrellm.net
+|  Copyright (C) 2015-2019 Bill Wilson    billw@gkrellm.net
 |
 |  PiKrellCam is free software: you can redistribute it and/or modify it
 |  under the terms of the GNU General Public License as published by
@@ -57,7 +57,7 @@
 
 #include "utils.h"
 
-#define	PIKRELLCAM_VERSION	"4.1.6"
+#define	PIKRELLCAM_VERSION	"4.3.1"
 
 
 //TCP Stream Server
@@ -257,7 +257,16 @@ typedef struct
 	}
 	MotionRegion;
 
+/* Motion types for writing the /run/pikrellcam/motion-events file
+*/
+#define	MOTION_EVENTS_HEADER	1
+#define MOTION_EVENTS_DETECT	2
+#define MOTION_EVENTS_START		(MOTION_EVENTS_HEADER | MOTION_EVENTS_DETECT)
+#define MOTION_EVENTS_STILL		4
+#define	MOTION_EVENTS_END		8
 
+/* Motion detect state/types for the MotionFrame
+*/
 #define	MOTION_NONE          0
 #define	MOTION_DETECTED      1
 #define	MOTION_DIRECTION     2
@@ -267,7 +276,7 @@ typedef struct
 #define	MOTION_PENDING_BURST 0x20
 #define	MOTION_AUDIO         0x40
 
-/* Possible motion types for a region
+/* Additional motion types for motion in regions.
 */
 #define MOTION_TYPE_DIR_SMALL      1
 #define MOTION_TYPE_DIR_NORMAL     2
@@ -404,9 +413,6 @@ typedef struct
 
 	int			record_start_frame_index;
 	float		actual_fps;
-
-	time_t		motion_last_detect_time,
-				motion_sync_time;
 	}
 	VideoCircularBuffer;
 
@@ -490,8 +496,9 @@ typedef struct
 	{
 	int		video_fps,
 			video_bitrate,
-			video_mp4box_fps,
-			still_quality;
+			still_quality,
+			video_mp4box_fps_display;
+	float	video_mp4box_fps;
 	boolean	modified;
 	}
 	CameraAdjust;
@@ -523,7 +530,12 @@ typedef struct
 	{
 
 	time_t	t_now,
-			t_start;
+			t_start,
+			motion_last_detect_time;
+
+	struct timeval
+			tv_now;
+
 	struct tm tm_local;
 	int		second_tick;
 	int		pi_model;
@@ -542,6 +554,7 @@ typedef struct
 			*command_fifo,
 			*state_filename,
 			*motion_events_filename,
+			*motion_detects_fifo,
 			*video_converting,
 			*loop_converting;
 
@@ -570,7 +583,9 @@ typedef struct
 			*longitude;
 
 	boolean	startup_motion_enable,
-			external_motion,
+			motion_detects_fifo_enable,
+			external_motion_record_event,
+			external_motion_still,
 			state_modified,
 			preset_state_modified,
 			config_modified,
@@ -579,14 +594,37 @@ typedef struct
 	int		config_sequence,
 			config_sequence_new;
 
+	boolean	config_media_sequence_modified;
+	char	*media_sequence_file;
+
 	MotionTimes
 			motion_times;
+
 	int		motion_vectors_dimming,
 			motion_magnitude_limit,
 			motion_magnitude_limit_count,
 			motion_burst_count,
 			motion_burst_frames,
 			motion_record_time_limit;
+
+	time_t	motion_sync_time;
+
+	char	*motion_stills_name_format,
+			*motion_still_pathname;
+	int		motion_stills_sequence,
+			motion_stills_per_minute,
+			motion_stills_count;
+	boolean	motion_still_capture_event;
+	time_t	motion_stills_capture_time;
+	struct timeval
+			motion_stills_start_tv;
+
+	struct timeval
+			motion_still_tv;
+
+	boolean	motion_stills_enable,
+			motion_stills_record;
+
 	char	*on_motion_begin_cmd,
 			*on_motion_end_cmd,
 			*on_motion_enable_cmd,
@@ -595,8 +633,8 @@ typedef struct
 			*motion_regions_name;
 	char	*preview_pathname,
 			*thumb_name;
-	char	*motion_preview_save_mode,
-			*on_motion_preview_save_cmd;
+	char	*on_motion_preview_save_cmd;
+
 	boolean	motion_preview_clean,
 			motion_vertical_filter,
 			motion_stats,
@@ -641,7 +679,8 @@ typedef struct
 
 	boolean	video_mp4box,
 			do_preview_save,
-			do_preview_save_cmd;
+			do_thumb_convert,
+			do_motion_still;
 
 	char	*mjpeg_filename;
 	int		mjpeg_width,
@@ -650,7 +689,8 @@ typedef struct
 			mjpeg_divider;
 
 	char	*still_name_format,
-			*still_last;
+			*still_last,
+			*still_thumb_dir;
 	int		still_sequence;
 	boolean	still_capture_event;
 	char	*on_still_capture_cmd;
@@ -801,6 +841,7 @@ typedef struct
 typedef union
 	{
 	int		*value;
+	float	*value_float;
 	char	**string;
 	}
 	ConfigResult;
@@ -857,7 +898,7 @@ boolean		resizer_create(char *name, CameraObject *resizer,
 void		mjpeg_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer);
 void		I420_video_callback(MMAL_PORT_T *port,
 					MMAL_BUFFER_HEADER_T *buffer);
-boolean		still_capture(char *fname);
+boolean		still_capture(char *fname, boolean motion_still);
 void		still_jpeg_callback(MMAL_PORT_T *port,
 					MMAL_BUFFER_HEADER_T *buffer);
 void		video_h264_encoder_callback(MMAL_PORT_T *port,
@@ -880,6 +921,8 @@ boolean			config_boolean_value(char *value);
 void			config_set_boolean(boolean *result, char *arg);
 void			config_timelapse_save_status(void);
 void			config_timelapse_load_status(void);
+void			config_media_sequence_save(void);
+void			config_media_sequence_load(void);
 
 char		*fname_base(char *path);
 void		log_printf_no_timestamp(char *fmt, ...);
@@ -903,9 +946,13 @@ void	motion_regions_config_save(char *config_file, boolean inform);
 boolean	motion_regions_config_load(char *config_file, boolean inform);
 void	motion_preview_file_event(void);
 void	motion_preview_area_fixup(void);
+void	make_preview_pathname(char *media_pathname);
 void	print_cvec(char *str, CompositeVector *cvec);
-void	motion_event_write(VideoCircularBuffer *vcb, MotionFrame *mf,
-					boolean start);
+void	motion_events_write(MotionFrame *mf, int type, float detect_time);
+void	motion_detects_fifo_write(MotionFrame *mf);
+
+void	motion_stills_start(MotionFrame *mf);
+void	motion_stills_stop(void);
 
 /* On Screen Display
 */
@@ -935,6 +982,7 @@ void	event_process(void);
 void	event_motion_enable_cmd(char *cmd);
 void	event_motion_begin_cmd(char *cmd);
 void	event_still_capture_cmd(char *cmd);
+void	event_motion_still_capture(void *path);
 
 void	event_video_diskfree_percent(char *type);
 void	event_archive_diskfree_percent(char *type);

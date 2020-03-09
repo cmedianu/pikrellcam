@@ -1,6 +1,6 @@
 /* PiKrellCam
 |
-|  Copyright (C) 2015-2016 Bill Wilson    billw@gkrellm.net
+|  Copyright (C) 2015-2019 Bill Wilson    billw@gkrellm.net
 |
 |  PiKrellCam is free software: you can redistribute it and/or modify it
 |  under the terms of the GNU General Public License as published by
@@ -50,7 +50,7 @@ MotionTimes		motion_times_temp;
 #define IMAGE_EFFECT		16
 #define MOTION_LIMIT		17
 #define SETTINGS			18
-#define MOTION_TIME			19
+#define MOTION_SETTINGS		19
 #define SERVO_SETTINGS		20
 #define LOOP_SETTINGS		21
 #define AUDIO_SETTINGS		22
@@ -70,7 +70,7 @@ static DisplayCommand display_commands[] =
 	{ ">",		  RIGHT_ARROW	  },
 	{ ">>",		  REPEAT_RIGHT_ARROW },
 	{ "back",	  BACK			  },
-	{ "motion_time",    MOTION_TIME  },
+	{ "motion_settings",    MOTION_SETTINGS  },
 	{ "motion_limit",   MOTION_LIMIT  },
 	{ "video_presets",      VIDEO_PRESET		  },
 	{ "still_presets",      STILL_PRESET	  },
@@ -104,9 +104,10 @@ InformLine		inform_line[N_INFORM_LINES];
 static int		inform_line_index;
 static boolean	inform_shown;
 
-static int	display_state;
-static int	display_menu;
-static int	display_action;
+static int		display_state,
+				display_menu,
+				display_action,
+				display_action_repeat_count;
 
 static DrawArea	top_status_area,
 				inform_area,
@@ -607,7 +608,7 @@ motion_draw(uint8_t *i420)
 	MotionRegion    *mreg;
 	CompositeVector *vec;
 	SList           *mrlist;
-	char            *msg, info[100], status[100];
+	char            *msg, *fifo_msg, info[100], status[100];
 	int16_t         color;			/* just B&W */
 	int             i, x, y, dx, dy, r, r_unit;
 	int             t_record, t_hold;
@@ -627,6 +628,7 @@ motion_draw(uint8_t *i420)
 					JUSTIFY_RIGHT(0), "Vectors: ON");
 		}
 
+	fifo_msg = "";
 	if (!inform_shown && (mf->show_preset || pikrellcam.preset_notify))
 		{
 		for (mrlist = mf->motion_region_list; mrlist; mrlist = mrlist->next)
@@ -707,6 +709,9 @@ motion_draw(uint8_t *i420)
 
 		if (pikrellcam.on_preset && !pikrellcam.preset_notify)
 			{
+			if (pikrellcam.motion_detects_fifo_enable)
+				fifo_msg = "Motion FIFO ON   ";
+
 			if (mf->frame_window > 0 && mf->motion_status == MOTION_NONE)
 				{
 				snprintf(status, sizeof(status), "confirming[%d]", mf->frame_window);
@@ -735,16 +740,19 @@ motion_draw(uint8_t *i420)
 			if (pikrellcam.motion_show_counts)
 				{
 				snprintf(info, sizeof(info),
-					"any:%-3d(%.1f) rej:%-3d spkl:%-3d(%.1f)  %s",
-					mf->any_count, mf->any_count_expma,
+					"%sany:%-3d(%.1f) rej:%-3d spkl:%-3d(%.1f)  %s",
+					fifo_msg, mf->any_count, mf->any_count_expma,
 					mf->reject_count, mf->sparkle_count, mf->sparkle_expma,
 					status);
 				i420_print(&bottom_status_area, normal_font, 0xff, 0, 0, 0,
 					JUSTIFY_LEFT, info);
 				}
-			else 
+			else
+				{
+				snprintf(info, sizeof(info), "%s%s", fifo_msg, status);
 				i420_print(&bottom_status_area, normal_font, 0xff, 0, 0, 0,
-					JUSTIFY_LEFT, status);
+					JUSTIFY_LEFT, info);
+				}
 			}
 		}
 	else
@@ -756,7 +764,7 @@ motion_draw(uint8_t *i420)
 		{
 		msg = "";
 		if (vcb->state & VCB_STATE_MOTION_RECORD)
-			msg = pikrellcam.external_motion ?
+			msg = pikrellcam.external_motion_record_event ?
 				(mf->fifo_detects ? mf->fifo_trigger_code : "Audio") : "Motion";
 		t_record = vcb->max_record_time - t_record;
 		if (t_record < 0)
@@ -764,10 +772,12 @@ motion_draw(uint8_t *i420)
 		snprintf(info, sizeof(info), "REC (Loop %s) %d:%02d",
 					msg, t_record / 60, t_record % 60);
 		}
-	else if (vcb->state & VCB_STATE_MOTION_RECORD)
+	else if (   (vcb->state & VCB_STATE_MOTION_RECORD)
+	         || pikrellcam.motion_stills_record
+	        )
 		{
-		if (pikrellcam.t_now > vcb->motion_sync_time)
-			t_record -= pikrellcam.t_now - vcb->motion_sync_time;
+		if (pikrellcam.t_now > pikrellcam.motion_sync_time)
+			t_record -= pikrellcam.t_now - pikrellcam.motion_sync_time;
 		if (mf->fifo_trigger_time_limit > 0)
 			{
 			t_hold = vcb->max_record_time -
@@ -779,9 +789,17 @@ motion_draw(uint8_t *i420)
 		else
 			{
 			t_hold = pikrellcam.motion_times.event_gap -
-					(pikrellcam.t_now - vcb->motion_last_detect_time);
-			snprintf(info, sizeof(info), "REC (%s) %d:%02d  hold %d:%02d",
-					pikrellcam.external_motion ?
+					(pikrellcam.t_now - pikrellcam.motion_last_detect_time);
+			if (pikrellcam.motion_stills_record)
+				snprintf(info, sizeof(info), "REC (%s) Stills: %d  hold %d:%02d",
+					pikrellcam.external_motion_record_event ?
+						(mf->fifo_detects ? mf->fifo_trigger_code : "Audio")
+									: "Motion",
+					pikrellcam.motion_stills_count,
+					t_hold / 60, t_hold % 60);
+			else
+				snprintf(info, sizeof(info), "REC (%s) %d:%02d  hold %d:%02d",
+					pikrellcam.external_motion_record_event ?
 						(mf->fifo_detects ? mf->fifo_trigger_code : "Audio")
 									: "Motion",
 					t_record / 60, t_record % 60,
@@ -812,6 +830,8 @@ motion_draw(uint8_t *i420)
 			else
 				msg = "Motion hold (off preset)";
 			}
+		else if (pikrellcam.motion_stills_enable)
+			msg = "Motion Stills  ON";
 		else
 			msg = "Motion  ON";
 		}
@@ -824,6 +844,10 @@ motion_draw(uint8_t *i420)
 		}
 	i420_print(&bottom_status_area, normal_font, 0xff, 1, 1, 0,
 					JUSTIFY_LEFT, msg);
+
+	if (pikrellcam.motion_detects_fifo_enable && !*fifo_msg)
+		i420_print(&bottom_status_area, normal_font, 0xff, 0, 1, 0,
+						JUSTIFY_LEFT, "Motion FIFO ON");
 
 	if (time_lapse.show_status)
 		{
@@ -923,8 +947,8 @@ static int		menu_white_balance_index;
 static SList 	*menu_image_effect_list;
 static int		menu_image_effect_index;
 
-static SList 	*menu_motion_time_list;
-static int		menu_motion_time_index;
+static SList 	*menu_motion_settings_list;
+static int		menu_motion_settings_index;
 
 static SList 	*menu_motion_limit_list;
 static int		menu_motion_limit_index;
@@ -1061,7 +1085,8 @@ typedef struct
 			increment,
 			value,
 			prev_value,
-			revert_value;
+			revert_value,
+			precision;
 	char	*units;
 	CameraParameter
 			*cam_param;
@@ -1072,17 +1097,17 @@ typedef struct
 
 static Adjustment	picture_adjustment[] =
 	{
-	{ "sharpness",  -100, 100, 1,   0, 0, 0, "", NULL, NULL },
-	{ "contrast",   -100, 100, 1,   0, 0, 0, "", NULL, NULL },
-	{ "brightness",    0, 100, 1,   0, 0, 0, "", NULL, NULL },
-	{ "saturation", -100, 100, 1,   0, 0, 0, "", NULL, NULL },
-	{ "iso",           0, 800, 100, 0, 0, 0, "", NULL, NULL },
-	{ "exposure_compensation", -25, 25, 1, 0, 0, 0, "", NULL, NULL },
-	{ "video_stabilisation", 0, 1, 1, 0, 0, 0, "", NULL, NULL },
-	{ "rotation",      0, 270, 90, 0, 0, 0, "", NULL, NULL },
-	{ "hflip",      0, 1, 1, 0, 0, 0, "", NULL, NULL },
-	{ "vflip",      0, 1, 1, 0, 0, 0, "", NULL, NULL },
-	{ "shutter_speed", 0, 6000000, 100, 0, 0, 0, "usec", NULL, NULL }
+	{ "sharpness",  -100, 100, 1,   0, 0, 0, 0, "", NULL, NULL },
+	{ "contrast",   -100, 100, 1,   0, 0, 0, 0, "", NULL, NULL },
+	{ "brightness",    0, 100, 1,   0, 0, 0, 0, "", NULL, NULL },
+	{ "saturation", -100, 100, 1,   0, 0, 0, 0, "", NULL, NULL },
+	{ "iso",           0, 800, 100, 0, 0, 0, 0, "", NULL, NULL },
+	{ "exposure_compensation", -25, 25, 1, 0, 0, 0, 0, "", NULL, NULL },
+	{ "video_stabilisation", 0, 1, 1, 0, 0, 0, 0, "", NULL, NULL },
+	{ "rotation",      0, 270, 90, 0, 0, 0, 0, "", NULL, NULL },
+	{ "hflip",      0, 1, 1, 0, 0, 0, 0, "", NULL, NULL },
+	{ "vflip",      0, 1, 1, 0, 0, 0, 0, "", NULL, NULL },
+	{ "shutter_speed", 0, 6000000, 100, 0, 0, 0, 0, "usec", NULL, NULL }
 	};
 
 #define N_PICTURE_ADJUSTMENTS \
@@ -1092,24 +1117,27 @@ static Adjustment	picture_adjustment[] =
   /* Adjustment changes made to a temp struct to avoid thrashing malloc/free
   |  of huge circular buffer.  Final change is applied if/when SEL is clicked.
   */
-Adjustment	motion_time_adjustment[] =
+Adjustment	motion_settings_adjustment[] =
 	{
-	{ "Confirm_Gap",  0, 30,  1, 0, 0, 0, "", NULL, &motion_times_temp.confirm_gap },
-	{ "Pre_Capture",  1, 180, 1, 0, 0, 0, "", NULL, &motion_times_temp.pre_capture },
-	{ "Event_Gap",    1, 300, 1, 0, 0, 0, "", NULL, &motion_times_temp.event_gap },
-	{ "Post_Capture", 1, 180, 1, 0, 0, 0, "", NULL, &motion_times_temp.post_capture },
-	{ "Motion_Time_Limit",   0, 1800, 10, 0, 0, 0, "sec", NULL, &pikrellcam.motion_record_time_limit }
+	{ "Startup_Motion",   0,  1,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.startup_motion_enable },
+	{ "Confirm_Gap",  0, 30,  1, 0, 0, 0, 0, "", NULL, &motion_times_temp.confirm_gap },
+	{ "Pre_Capture",  1, 180, 1, 0, 0, 0, 0, "", NULL, &motion_times_temp.pre_capture },
+	{ "Event_Gap",    1, 300, 1, 0, 0, 0, 0, "", NULL, &motion_times_temp.event_gap },
+	{ "Post_Capture", 1, 180, 1, 0, 0, 0, 0, "", NULL, &motion_times_temp.post_capture },
+	{ "Video_Time_Limit",   0, 1800, 10, 0, 0, 0, 0, "sec", NULL, &pikrellcam.motion_record_time_limit },
+	{ "Motion_Stills_(no_videos)",   0,  1,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.motion_stills_enable },
+	{ "Max_Stills_per_Minute", 1, 60, 1, 0, 0, 0, 0, "", NULL, &pikrellcam.motion_stills_per_minute}
 	};
 
-#define N_MOTION_TIME_ADJUSTMENTS \
-		(sizeof(motion_time_adjustment) / sizeof(Adjustment))
+#define N_MOTION_SETTINGS_ADJUSTMENTS \
+		(sizeof(motion_settings_adjustment) / sizeof(Adjustment))
 
 Adjustment	motion_limit_adjustment[] =
 	{
-	{ "Vector_Magnitude",  2, 50, 1, 0, 0, 0, "", NULL, &pikrellcam.motion_magnitude_limit },
-	{ "Vector_Count",      2, 50, 1, 0, 0, 0, "", NULL, &pikrellcam.motion_magnitude_limit_count },
-	{ "Burst_Count",      50, 2000, 10, 0, 0, 0, "", NULL, &pikrellcam.motion_burst_count },
-	{ "Burst_Frames",      2, 20, 1, 0, 0, 0, "", NULL, &pikrellcam.motion_burst_frames }
+	{ "Vector_Magnitude",  2, 50, 1, 0, 0, 0, 0, "", NULL, &pikrellcam.motion_magnitude_limit },
+	{ "Vector_Count",      2, 50, 1, 0, 0, 0, 0, "", NULL, &pikrellcam.motion_magnitude_limit_count },
+	{ "Burst_Count",      50, 2000, 10, 0, 0, 0, 0, "", NULL, &pikrellcam.motion_burst_count },
+	{ "Burst_Frames",      2, 20, 1, 0, 0, 0, 0, "", NULL, &pikrellcam.motion_burst_frames }
 	};
 
 #define N_MOTION_LIMIT_ADJUSTMENTS \
@@ -1121,19 +1149,18 @@ Adjustment	motion_limit_adjustment[] =
   */
 Adjustment	settings_adjustment[] =
 	{
-	{ "Startup_Motion",   0,  1,  1, 0, 0, 0, "", NULL, &pikrellcam.startup_motion_enable },
-//	{ "Vertical_Filter",  0,  1,  1, 0, 0, 0, "", NULL, &pikrellcam.motion_vertical_filter },
-	{ "Check_Media_Diskfree",   0, 1,  1, 0, 0, 0, "", NULL, &pikrellcam.check_media_diskfree },
-	{ "Check_Archive_Diskfree", 0, 1,  1, 0, 0, 0, "", NULL, &pikrellcam.check_archive_diskfree },
-	{ "Diskfree_Percent",  5,  90, 1, 0, 0, 0, "", NULL, &pikrellcam.diskfree_percent },
-	{ "video_bitrate",   1000000, 25000000, 100000, 0, 0, 0, "", NULL, &camera_adjust_temp.video_bitrate },
-	{ "video_fps",       1,    30,    1,   0, 0, 0, "", NULL, &camera_adjust_temp.video_fps },
-	{ "video_mp4box_fps",  0,    30,    1,   0, 0, 0, "", NULL, &camera_adjust_temp.video_mp4box_fps },
-	{ "mjpeg_divider",  1,  12,   1,   0, 0, 0, "", NULL, &pikrellcam.mjpeg_divider },
-	{ "still_quality",  5,    100,   1,   0, 0, 0, "", NULL, &camera_adjust_temp.still_quality },
-	{ "Vector_Counts",  0,  1,  1, 0, 0, 0, "", NULL, &pikrellcam.motion_show_counts },
-	{ "Vector_Dimming", 30, 60, 1, 0, 0, 0, "", NULL, &pikrellcam.motion_vectors_dimming },
-	{ "Preview_Clean",  0,  1,  1, 0, 0, 0, "", NULL, &pikrellcam.motion_preview_clean },
+//	{ "Vertical_Filter",  0,  1,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.motion_vertical_filter },
+	{ "Check_Media_Diskfree",   0, 1,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.check_media_diskfree },
+	{ "Check_Archive_Diskfree", 0, 1,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.check_archive_diskfree },
+	{ "Diskfree_Percent",  5,  90, 1, 0, 0, 0, 0, "", NULL, &pikrellcam.diskfree_percent },
+	{ "video_bitrate",   1000000, 25000000, 100000, 0, 0, 0, 0, "", NULL, &camera_adjust_temp.video_bitrate },
+	{ "video_fps",       1,    30,    1,   0, 0, 0, 0, "", NULL, &camera_adjust_temp.video_fps },
+	{ "video_mp4box_fps",  0,    3000,    1,   0, 0, 0, 2, "", NULL, &camera_adjust_temp.video_mp4box_fps_display },
+	{ "mjpeg_divider",  1,  12,   1,   0, 0, 0, 0, "", NULL, &pikrellcam.mjpeg_divider },
+	{ "still_quality",  5,    100,   1,   0, 0, 0, 0, "", NULL, &camera_adjust_temp.still_quality },
+	{ "Vector_Counts",  0,  1,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.motion_show_counts },
+	{ "Vector_Dimming", 30, 60, 1, 0, 0, 0, 0, "", NULL, &pikrellcam.motion_vectors_dimming },
+	{ "Preview_Clean",  0,  1,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.motion_preview_clean },
 	};
 
 
@@ -1143,9 +1170,9 @@ Adjustment	settings_adjustment[] =
 
 Adjustment	loop_settings_adjustment[] =
 	{
-	{ "Startup_Loop",     0,  1,  1, 0, 0, 0, "", NULL, &pikrellcam.loop_startup_enable },
-	{ "Time_Limit",   10, 900, 10, 0, 0, 0, "sec", NULL, &pikrellcam.loop_record_time_limit },
-	{ "Diskusage_Percent", 5, 95, 1,   0, 0, 0, "", NULL, &pikrellcam.loop_diskusage_percent }
+	{ "Startup_Loop",     0,  1,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.loop_startup_enable },
+	{ "Time_Limit",   10, 900, 10, 0, 0, 0, 0, "sec", NULL, &pikrellcam.loop_record_time_limit },
+	{ "Diskusage_Percent", 5, 95, 1,   0, 0, 0, 0, "", NULL, &pikrellcam.loop_diskusage_percent }
 	};
 
 #define N_LOOP_SETTINGS_ADJUSTMENTS \
@@ -1153,9 +1180,9 @@ Adjustment	loop_settings_adjustment[] =
 
 Adjustment	audio_settings_adjustment[] =
 	{
-	{ "Audio_Trigger_Video", 0,  1,  1, 0, 0, 0, "", NULL, &pikrellcam.audio_trigger_video },
-	{ "Audio_Trigger_Level", 2, 100, 1, 0, 0, 0, "", NULL, &pikrellcam.audio_trigger_level },
-	{ "Box_MP3_Only",  0, 1, 1, 0, 0, 0, "", NULL, &pikrellcam.audio_box_MP3_only }
+	{ "Audio_Trigger_Video", 0,  1,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.audio_trigger_video },
+	{ "Audio_Trigger_Level", 2, 100, 1, 0, 0, 0, 0, "", NULL, &pikrellcam.audio_trigger_level },
+	{ "Box_MP3_Only",  0, 1, 1, 0, 0, 0, 0, "", NULL, &pikrellcam.audio_box_MP3_only }
 	};
 
 #define N_AUDIO_SETTINGS_ADJUSTMENTS \
@@ -1163,17 +1190,17 @@ Adjustment	audio_settings_adjustment[] =
 
 Adjustment	servo_settings_adjustment[] =
 	{
-	{ "Motion_Off_Preset",   0,  1,  1, 0, 0, 0, "", NULL, &pikrellcam.motion_off_preset },
-	{ "Move_Step_msec",    0,   200,  1, 0, 0, 0, "", NULL, &pikrellcam.servo_move_step_msec },
-	{ "Preset_Step_msec",  0,   100,  1, 0, 0, 0, "", NULL, &pikrellcam.servo_preset_step_msec },
-	{ "Servo_Settle_msec", 200,  1000,  1, 0, 0, 0, "", NULL, &pikrellcam.servo_settle_msec },
-	{ "Move_Steps",        5,    30,  1, 0, 0, 0, "", NULL, &pikrellcam.servo_move_steps },
-	{ "Pan_Left_Limit",    SERVO_MIN_WIDTH,  SERVO_MAX_WIDTH,  1, 0, 0, 0, "", NULL, &pikrellcam.servo_pan_min },
-	{ "Pan_Right_Limit",   SERVO_MIN_WIDTH,  SERVO_MAX_WIDTH,  1, 0, 0, 0, "", NULL, &pikrellcam.servo_pan_max },
-	{ "Tilt_Up_Limit",     SERVO_MIN_WIDTH,  SERVO_MAX_WIDTH,  1, 0, 0, 0, "", NULL, &pikrellcam.servo_tilt_max },
-	{ "Tilt_Down_Limit",   SERVO_MIN_WIDTH,  SERVO_MAX_WIDTH,  1, 0, 0, 0, "", NULL, &pikrellcam.servo_tilt_min },
-	{ "Servo_Pan_Invert",   0,  1,  1, 0, 0, 0, "", NULL, &pikrellcam.servo_pan_invert },
-	{ "Servo_Tilt_Invert",  0,  1,  1, 0, 0, 0, "", NULL, &pikrellcam.servo_tilt_invert }
+	{ "Motion_Off_Preset",   0,  1,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.motion_off_preset },
+	{ "Move_Step_msec",    0,   200,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.servo_move_step_msec },
+	{ "Preset_Step_msec",  0,   100,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.servo_preset_step_msec },
+	{ "Servo_Settle_msec", 200,  1000,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.servo_settle_msec },
+	{ "Move_Steps",        5,    30,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.servo_move_steps },
+	{ "Pan_Left_Limit",    SERVO_MIN_WIDTH,  SERVO_MAX_WIDTH,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.servo_pan_min },
+	{ "Pan_Right_Limit",   SERVO_MIN_WIDTH,  SERVO_MAX_WIDTH,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.servo_pan_max },
+	{ "Tilt_Up_Limit",     SERVO_MIN_WIDTH,  SERVO_MAX_WIDTH,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.servo_tilt_max },
+	{ "Tilt_Down_Limit",   SERVO_MIN_WIDTH,  SERVO_MAX_WIDTH,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.servo_tilt_min },
+	{ "Servo_Pan_Invert",   0,  1,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.servo_pan_invert },
+	{ "Servo_Tilt_Invert",  0,  1,  1, 0, 0, 0, 0, "", NULL, &pikrellcam.servo_tilt_invert }
 	};
 
 #define PAN_LEFT_LIMIT_INDEX	5
@@ -1241,7 +1268,7 @@ apply_adjustment(void)
 
 	if (!adjustments || !cur_adj)
 		return FALSE;
-	if (adjustments == &motion_time_adjustment[0])
+	if (adjustments == &motion_settings_adjustment[0])
 		{
 		pikrellcam.motion_times.confirm_gap = motion_times_temp.confirm_gap;
 		pikrellcam.motion_times.post_capture = motion_times_temp.post_capture;
@@ -1268,6 +1295,13 @@ apply_adjustment(void)
 				}
 			pthread_mutex_unlock(&vcb->mutex);
 			}
+		if (pikrellcam.motion_stills_enable && pikrellcam.loop_enable)
+			{
+			pikrellcam.motion_stills_enable = FALSE;
+			display_inform("\"Cannot enable motion stills\" 3 3 1");
+			display_inform("\"while loop videos are enabled.\" 4 3 1");
+			display_inform("timeout 3");
+			}
 		}
 	else if (adjustments == &motion_limit_adjustment[0])
 		{
@@ -1289,6 +1323,8 @@ apply_adjustment(void)
 		}
 	else if (adjustments == &settings_adjustment[0])
 		{
+		camera_adjust_temp.video_mp4box_fps =
+				(float) camera_adjust_temp.video_mp4box_fps_display / 100.0;
 		if (   camera_adjust_temp.video_fps != pikrellcam.camera_adjust.video_fps
 		    || camera_adjust_temp.still_quality != pikrellcam.camera_adjust.still_quality
 		    || camera_adjust_temp.video_bitrate != pikrellcam.camera_adjust.video_bitrate
@@ -1342,8 +1378,8 @@ display_adjustment(uint8_t *i420)
 	DrawArea	*da = &adj_control_area;
 	GlcdFont	*font = normal_font;
 	char		buf[50];
-	int			bar_x0, bar_y0, bar_dy, bar_width, adj_x, fast_factor;
-	int			pan, tilt, max, min;
+	int			bar_x0, bar_y0, bar_dy, bar_width, adj_x, accel;
+	int			pan, tilt, max, min, scale, n;
 	static int	prev_action;
 	boolean		boolean_flag = FALSE;
 
@@ -1401,11 +1437,17 @@ display_adjustment(uint8_t *i420)
 	             || prev_action == REPEAT_RIGHT_ARROW
 	            )
 	        )
+		{
 		display_action = prev_action;
+		display_action_repeat_count += 1;
+		}
 	else if (display_action == REPEAT_LEFT_ARROW && prev_action == REPEAT_LEFT_ARROW)
 		display_action = ACTION_NONE;
 	else if (display_action == REPEAT_RIGHT_ARROW && prev_action == REPEAT_RIGHT_ARROW)
 		display_action = ACTION_NONE;
+
+	if (display_action == ACTION_NONE)
+		display_action_repeat_count = 0;
 
 	/* Set cur adjust to config value if it changed while adjusting.
 	|  For if a FIFO command sets it while we are adjusting.
@@ -1430,22 +1472,43 @@ display_adjustment(uint8_t *i420)
 		}
 #endif
 
-	fast_factor = 2;
-	while ((cur_adj->max - cur_adj->min) / (fast_factor * cur_adj->increment)
-				> 50)
-		fast_factor += 1;
+	for (n = 1, scale = 1; n <= cur_adj->precision; ++n)
+		scale *= 10;
 
-	if (fast_factor > 20)	/* XXX for shutter_speed, this needs work */
-		fast_factor = 20;
+	accel = 1;
+	n = (cur_adj->max - cur_adj->min) / scale;
+	while (n / (accel * cur_adj->increment) > 200)
+		accel += 1;
+
+	if (display_action_repeat_count > 80)
+		accel *= 50;
+	else if (display_action_repeat_count > 70)
+		accel *= 20;
+	else if (display_action_repeat_count > 60)
+		accel *= 12;
+	else if (display_action_repeat_count > 50)
+		accel *= 8;
+	else if (display_action_repeat_count > 35)
+		accel *= 5;
+	else if (display_action_repeat_count > 25)
+		accel *= 3;
+	else if (display_action_repeat_count > 15)
+		accel *= 2;
+
+	if (display_action == REPEAT_LEFT_ARROW || display_action == REPEAT_RIGHT_ARROW)
+		display_action_repeat_count += 1;
+
+	if (accel > 400)
+		accel = 400;
 
 	if (display_action == LEFT_ARROW)
 		cur_adj->value -= cur_adj->increment;
 	else if (display_action == RIGHT_ARROW)
 		cur_adj->value += cur_adj->increment;
 	else if (display_action == REPEAT_LEFT_ARROW)
-		cur_adj->value -= fast_factor * cur_adj->increment;
+		cur_adj->value -= accel * cur_adj->increment;
 	else if (display_action == REPEAT_RIGHT_ARROW)
-		cur_adj->value += fast_factor * cur_adj->increment;
+		cur_adj->value += accel * cur_adj->increment;
 
 	if (cur_adj->value > cur_adj->max)
 		{
@@ -1538,21 +1601,27 @@ display_adjustment(uint8_t *i420)
 	if (boolean_flag)
 		snprintf(buf, sizeof(buf), "%s", "");
 	else
-		snprintf(buf, sizeof(buf), "%d", cur_adj->min);
+		snprintf(buf, sizeof(buf), "%d", cur_adj->min / scale);
 	i420_print(da, font, 0xff, 1, bar_x0 - 2, 0, JUSTIFY_LEFT_AT_X, buf);
 
 	if (boolean_flag)
 		snprintf(buf, sizeof(buf), "%s", "");
 	else
-		snprintf(buf, sizeof(buf), "%d", cur_adj->max);
+		snprintf(buf, sizeof(buf), "%d", cur_adj->max /scale);
 	i420_print(da, font, 0xff, 1, bar_x0 + bar_width + 2, 0, JUSTIFY_LEFT, buf);
 
 	if (boolean_flag)
 		snprintf(buf, sizeof(buf), "%s", cur_adj->value ? "ON" : "OFF");
+	else if (   adjustments == &motion_settings_adjustment[0]
+	         && cur_adj->value == 0
+	        )
+		snprintf(buf, sizeof(buf), "OFF");
+	else if (scale > 1)
+		snprintf(buf, sizeof(buf), "%.2f", (float) cur_adj->value / (float) scale);
 	else
 		snprintf(buf, sizeof(buf), "%d", cur_adj->value);
-	i420_print(da, font, 0xff, 0, adj_x, 0, JUSTIFY_CENTER_AT_X, buf);
 
+	i420_print(da, font, 0xff, 0, adj_x, 0, JUSTIFY_CENTER_AT_X, buf);
 	i420_print(da, font, 0xff, 2, 0, 0, JUSTIFY_CENTER, cur_adj->name);
 	}
 
@@ -1579,9 +1648,9 @@ display_draw_menu(uint8_t *i420)
 				adjustments = &motion_limit_adjustment[0];
 				cur_adj_start = TRUE;
 				break;
-			case MOTION_TIME:
+			case MOTION_SETTINGS:
 				display_state = DISPLAY_ADJUSTMENT;
-				adjustments = &motion_time_adjustment[0];
+				adjustments = &motion_settings_adjustment[0];
 				cur_adj_start = TRUE;
 				break;
 			case SETTINGS:
@@ -1783,11 +1852,11 @@ display_command(char *cmd)
 				display_menu = DISPLAY_MENU_NONE;
 				}
 			break;
-		case MOTION_TIME:
-			display_menu_list = menu_motion_time_list;
-			display_menu_index = &menu_motion_time_index;
+		case MOTION_SETTINGS:
+			display_menu_list = menu_motion_settings_list;
+			display_menu_index = &menu_motion_settings_index;
 			display_state = DISPLAY_MENU;
-			display_menu = MOTION_TIME;
+			display_menu = MOTION_SETTINGS;
 			break;
 		case MOTION_LIMIT:
 			display_menu_list = menu_motion_limit_list;
@@ -2117,17 +2186,17 @@ display_init(void)
 			bottom_status_area.x0, bottom_status_area.y0,
 			bottom_status_area.width, bottom_status_area.height);
 		}
-	if (!menu_motion_time_list)
+	if (!menu_motion_settings_list)
 		{
-		for (i = 0, position = 0; i < N_MOTION_TIME_ADJUSTMENTS; ++i)
+		for (i = 0, position = 0; i < N_MOTION_SETTINGS_ADJUSTMENTS; ++i)
 			{
-			adj = &motion_time_adjustment[i];
+			adj = &motion_settings_adjustment[i];
 			entry = calloc(1, sizeof(MenuEntry));
 			entry->name = adj->name;
 			entry->length = strlen(entry->name);
 			entry->line_position = position;
 			position += entry->length + 1;
-			menu_motion_time_list = slist_append(menu_motion_time_list, entry);
+			menu_motion_settings_list = slist_append(menu_motion_settings_list, entry);
 			}
 		}
 	if (!menu_motion_limit_list)

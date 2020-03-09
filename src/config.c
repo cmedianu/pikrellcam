@@ -1,6 +1,6 @@
 /* PiKrellCam
 |
-|  Copyright (C) 2015-2017 Bill Wilson    billw@gkrellm.net
+|  Copyright (C) 2015-2019 Bill Wilson    billw@gkrellm.net
 |
 |  PiKrellCam is free software: you can redistribute it and/or modify it
 |  under the terms of the GNU General Public License as published by
@@ -522,6 +522,21 @@ config_value_int_set(char *arg, ConfigResult *result)
 	return valid;
 	}
 
+static int
+config_value_float_set(char *arg, ConfigResult *result)
+	{
+	int	valid = TRUE;
+
+	if (isdigit(*arg) || (*arg == '-' && isdigit((*(arg + 1)))))
+		*result->value_float = atof(arg);
+	else
+		{
+		printf("    Bad config_value_float_set: %s\n", arg);
+		valid = FALSE;
+		}
+	return valid;
+	}
+
 
 static Config  config[] =
 	{
@@ -604,6 +619,16 @@ static Config  config[] =
 	  "#",
 	"loop_diskusage_percent",  "30", FALSE, {.value = &pikrellcam.loop_diskusage_percent},      config_value_int_set},
 
+	{ "\n# -------------------- Motion Still Recording -----------------------\n"
+	  "# Take still images instead of recording videos when motion is enabled.\n"
+	  "#",
+	"motion_stills_enable",	"off", FALSE, {.value = &pikrellcam.motion_stills_enable},       config_value_bool_set},
+
+	{ "# Motion still images per minute range from 1 to 60 which gives a\n"
+	  "# max rate range of 1 per minute to 1 per second.\n"
+	  "# Stills are taken at motion detects separated by at least this rate.\n"
+	  "#",
+	"motion_stills_per_minute",  "30", TRUE, {.value = &pikrellcam.motion_stills_per_minute}, config_value_int_set },
 
 	{ "\n# -------------------- Motion Detect Options -----------------------\n"
 	  "# PiKrellCam V3.0 stores some motion detect settings in preset-xxx.conf\n"
@@ -657,7 +682,7 @@ static Config  config[] =
 	"motion_pre_capture",   "5", TRUE, {.value = &pikrellcam.motion_times.pre_capture},  config_value_int_set },
 
 	{ "# Seconds of video that will be recorded after the last motion event.\n"
-	  "# motion_post_caputure must be <= motion_event_gap.\n"
+	  "# motion_post_capture must be <= motion_event_gap.\n"
 	  "#",
 	"motion_post_capture",  "5", TRUE, {.value = &pikrellcam.motion_times.post_capture}, config_value_int_set },
 
@@ -690,14 +715,6 @@ static Config  config[] =
 	{ "# Command/script to run when a manual record ends.\n"
 	  "#",
 	"on_manual_end",    "", TRUE, {.string = &pikrellcam.on_manual_end_cmd}, config_string_set },
-
-	{ "# When to save the motion preview file.\n"
-	  "#     first  - when motion is first detected.\n"
-	  "#              The on_motion_preview_save command runs immediately.\n"
-	  "#     best   - best motion based on vector count and position.\n"
-	  "#              The on_motion_preview_save command runs at motion end.\n"
-	  "#",
-	"motion_preview_save_mode", "best", FALSE, {.string = &pikrellcam.motion_preview_save_mode}, config_string_set },
 
 	{ "# Command to run on the motion preview jpeg file.\n"
 	  "# Specify the preview jpeg file name with $F.\n"
@@ -744,6 +761,12 @@ static Config  config[] =
 	  "# For users who have a need for advanced video post processing.\n"
 	  "#",
 	"motion_stats",  "off", FALSE, {.value = &pikrellcam.motion_stats}, config_value_bool_set },
+
+	{ "# Enable writing all motion detects to ~/pikrellcam/www/motion_detects_fifo\n"
+	  "# Motion detects are written regardless of motion videos enabled state,\n"
+	  "# so this provides a front end motion detect function for another app.\n"
+	  "#",
+	"motion_detects_fifo_enable",  "off", FALSE, {.value = &pikrellcam.motion_detects_fifo_enable}, config_value_bool_set },
 
 	{ "# Command/script to run when receiving a user defined multicast\n"
 	  "# pkc-message sent by other PiKrellCams or separate scripts on your LAN.\n"
@@ -858,19 +881,19 @@ static Config  config[] =
 	  "#",
 	"video_height",   "1080", TRUE, {.value = &pikrellcam.camera_config.video_height},     config_value_int_set },
 
-	{ "# Video frames per second.  The processing required to implement the\n"
-	  "# multiple video paths in PiKrellCam limits this fps to about 24.\n"
-	  "# Above that may cause web page mjpeg frames to be dropped.  But if\n"
-	  "# you are overclocking the GPU you may be able to set higher.\n"
+	{ "# Video frames per second.  If set higher than 24 the motion detecting\n"
+	  "# preview stream can drop frames depending on Pi model (GPU clock speed).\n"
 	  "#",
 	"video_fps",      "24", FALSE, {.value = &pikrellcam.camera_adjust.video_fps},        config_value_int_set },
 
 	{ "# MP4Box output frames per second if video filename is a .mp4\n"
-	  "# If this is non zero and different from video_fps, the final mp4 will\n"
+	  "# If set non zero and different from video_fps, the final mp4 will\n"
 	  "# be a slow or fast motion video.\n"
-	  "# Normally leave this set to zero so it will track video_fps.\n"
+	  "# Normally leave this set to zero so it will track video_fps or set\n"
+	  "# to fractional values slightly different from video_fps to tune for\n"
+	  "# possible audio/video drift for longer videos.\n"
 	  "#",
-	"video_mp4box_fps", "0", FALSE, {.value = &pikrellcam.camera_adjust.video_mp4box_fps},        config_value_int_set },
+	"video_mp4box_fps", "0", FALSE, {.value_float = &pikrellcam.camera_adjust.video_mp4box_fps},        config_value_float_set },
 
 	{ "# Video bitrate affects the quality and size of a video recording.\n"
 	  "# Along with pre_capture and event_gap times, it also determines the\n"
@@ -1203,6 +1226,8 @@ config_set_defaults(char *home_dir)
 
 	pikrellcam.version = strdup(PIKRELLCAM_VERSION);
 	pikrellcam.timelapse_format = strdup("tl_$n_$N.jpg");
+	pikrellcam.motion_stills_name_format = strdup("%F_%H.%M.%S_$N.jpg");
+
 	pikrellcam.preview_pathname = strdup("");
 	pikrellcam.thumb_name = strdup("");
 	pikrellcam.multicast_group_IP = "225.0.0.55";
@@ -1229,6 +1254,8 @@ config_set_defaults(char *home_dir)
 					pikrellcam.config_dir, PIKRELLCAM_AT_COMMANDS_CONFIG);
 		asprintf(&pikrellcam.timelapse_status_file, "%s/%s",
 					pikrellcam.config_dir, PIKRELLCAM_TIMELAPSE_STATUS);
+		asprintf(&pikrellcam.media_sequence_file, "%s/%s",
+					pikrellcam.config_dir, "media-sequence");
 		}
 
 	/* Make sure some motion regions exist.  These will be replaced if there
@@ -1290,6 +1317,11 @@ config_load(char *config_file)
 	   )
 		pikrellcam.motion_record_time_limit = 10;
 
+	if (pikrellcam.motion_stills_per_minute > 60)
+		pikrellcam.motion_stills_per_minute = 60;
+	else if (pikrellcam.motion_stills_per_minute < 1)
+		pikrellcam.motion_stills_per_minute = 1;
+
 	if (pikrellcam.diskfree_percent < 5)
 		pikrellcam.diskfree_percent = 5;
 	if (pikrellcam.loop_diskusage_percent < 5)
@@ -1333,6 +1365,13 @@ config_load(char *config_file)
 
 
 	pikrellcam.annotate_string_space_char = '_';
+
+	n = (int) ((pikrellcam.camera_adjust.video_mp4box_fps + .0005) * 100.0);
+	if (n < 0)
+		n = 0;
+	if (n > 3000)
+		n = 3000;
+	pikrellcam.camera_adjust.video_mp4box_fps_display = n;
 
 	camera_adjust_temp = pikrellcam.camera_adjust;
 	motion_times_temp = pikrellcam.motion_times;
@@ -1403,6 +1442,8 @@ config_save(char *config_file)
 		fprintf(f, "%s\n", cfg->description);
 		if (cfg->config_func == config_value_int_set)
 			fprintf(f, "%s %d\n\n", cfg->option, *(cfg->result.value));
+		else if (cfg->config_func == config_value_float_set)
+			fprintf(f, "%s %.3f\n\n", cfg->option, *(cfg->result.value_float));
 		else if (cfg->config_func == config_value_bool_set)
 			fprintf(f, "%s %s\n\n", cfg->option, *(cfg->result.value) ? "on" : "off");
 		else
@@ -1467,6 +1508,63 @@ config_timelapse_load_status(void)
 		{
 		time_lapse.period = 60;
 		config_timelapse_save_status();
+		}
+	}
+
+void
+config_media_sequence_save(void)
+	{
+	FILE	*f;
+	char	buf[64];
+
+	f = fopen(pikrellcam.media_sequence_file, "w");
+	if (f)
+		{
+		strftime(buf, sizeof(buf), "%F", localtime(&pikrellcam.t_now));
+		fprintf(f, "%s\n", buf);
+		fprintf(f, "motion_videos %d\n", pikrellcam.video_motion_sequence);
+		fprintf(f, "manual_videos %d\n", pikrellcam.video_manual_sequence);
+		fprintf(f, "motion_stills %d\n", pikrellcam.motion_stills_sequence);
+		fprintf(f, "manual_stills %d\n", pikrellcam.still_sequence);
+		fclose(f);
+		}
+	pikrellcam.config_media_sequence_modified = FALSE;
+	}
+
+void
+config_media_sequence_load(void)
+	{
+	FILE	*f;
+	int		n, seq;
+	char	buf[100], tag[32], buf1[64];
+
+	pikrellcam.video_motion_sequence = 0;
+	pikrellcam.video_manual_sequence = 0;
+	pikrellcam.motion_stills_sequence = 0;
+	pikrellcam.still_sequence = 0;
+	f = fopen(pikrellcam.media_sequence_file, "r");
+	if (f)
+		{
+		fgets(buf, sizeof(buf), f);
+		strftime(buf1, sizeof(buf1), "%F\n", localtime(&pikrellcam.t_now));
+		if (!strcmp(buf, buf1))
+			{
+			while (fgets(buf, sizeof(buf), f) != NULL)
+				{
+				n = sscanf(buf, "%s %d\n", tag, &seq);
+				if (n != 2)
+					continue;
+				if (!strcmp(tag, "motion_videos"))
+					pikrellcam.video_motion_sequence = seq;
+				else if (!strcmp(tag, "manual_videos"))
+					pikrellcam.video_manual_sequence = seq;
+				else if (!strcmp(tag, "motion_stills"))
+					pikrellcam.motion_stills_sequence = seq;
+				else if (!strcmp(tag, "manual_stills"))
+					pikrellcam.still_sequence = seq;
+				}
+			}
+		fclose(f);
 		}
 	}
 
